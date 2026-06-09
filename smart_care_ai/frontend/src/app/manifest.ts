@@ -1,0 +1,20 @@
+import { MetadataRoute } from 'next'
+
+export default function manifest(): MetadataRoute.Manifest {
+  return {
+    name: 'Smart Care AI Nurse',
+    short_name: 'Smart Care',
+    description: 'Personal AI Nurse for Smart Care Hospital Patients',
+    start_url: '/patient/login',
+    display: 'standalone',
+    background_color: '#ffffff',
+    theme_color: '#0ea5e9',
+    icons: [
+      {
+        src: '/favicon.ico',
+        sizes: 'any',
+        type: 'image/x-icon',
+      },
+    ],
+  }
+}

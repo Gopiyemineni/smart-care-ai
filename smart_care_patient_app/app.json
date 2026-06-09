@@ -1,0 +1,37 @@
+{
+  "expo": {
+    "name": "Smart Care",
+    "slug": "smart-care-patient",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "dark",
+    "newArchEnabled": true,
+    "splash": {
+      "image": "./assets/splash-icon.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#020817"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.smartcare.patient"
+    },
+    "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#020817"
+      },
+      "edgeToEdgeEnabled": true,
+      "predictiveBackGestureEnabled": false,
+      "package": "com.smartcare.patient"
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "extra": {
+      "eas": {
+        "projectId": "bfea8fc9-30cb-4a1c-8456-806215301568"
+      }
+    }
+  }
+}

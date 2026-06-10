@@ -89,6 +89,9 @@ STRICT RULES — నువ్వు ఏ పరిస్థితిలోనూ 
   const aiTalkingRef = useRef(false);
 
   const inCtxRef = useRef<AudioContext|null>(null);
+  const playbackNodeRef = useRef<AudioWorkletNode|null>(null);
+  const waitingForGoodbyeSpeechRef = useRef(false);
+  const goodbyeSpeechStartedRef = useRef(false);
 
   const connectLiveAPI = useCallback(async () => {
 
@@ -102,15 +105,16 @@ STRICT RULES — నువ్వు ఏ పరిస్థితిలోనూ 
         audioCtxRef.current = outCtx;
       }
       if (outCtx.state === "suspended") {
-        outCtx.resume().catch(e => console.warn("outCtx resume failed:", e));
+        await outCtx.resume().catch(e => console.warn("outCtx resume failed:", e));
       }
       try {
-        outCtx.audioWorklet.addModule("/audio-processor.js").catch(() => {});
+        await outCtx.audioWorklet.addModule("/audio-processor.js").catch(() => {});
       } catch (err) {
         // Module might already be added, ignore
       }
       const playbackNode = new AudioWorkletNode(outCtx, "audio-playback-worklet");
       playbackNode.connect(outCtx.destination);
+      playbackNodeRef.current = playbackNode;
 
       // 2. Input Audio Context (16kHz for Gemini STT)
       let inCtx = inCtxRef.current;
@@ -120,23 +124,57 @@ STRICT RULES — నువ్వు ఏ పరిస్థితిలోనూ 
         inCtxRef.current = inCtx;
       }
       if (inCtx.state === "suspended") {
-        inCtx.resume().catch(e => console.warn("inCtx resume failed:", e));
+        await inCtx.resume().catch(e => console.warn("inCtx resume failed:", e));
       }
       try {
-        inCtx.audioWorklet.addModule("/audio-processor.js").catch(() => {});
+        await inCtx.audioWorklet.addModule("/audio-processor.js").catch(() => {});
       } catch (err) {
         // Module might already be added, ignore
       }
       const recorderNode = new AudioWorkletNode(inCtx, "audio-recorder-worklet");
 
+      // Always stop previous mic stream tracks to guarantee fresh state
       if (micStreamRef.current) {
-        const source = inCtx.createMediaStreamSource(micStreamRef.current);
+        micStreamRef.current.getTracks().forEach(t => t.stop());
+      }
+
+      let micStream = null;
+      try {
+        console.log("🎤 [Audio Graph] Acquiring fresh microphone stream...");
+        micStream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true
+          }
+        });
+        micStreamRef.current = micStream;
+
+        // Print track details for debugging (enabled, muted, readyState)
+        const tracks = micStream.getAudioTracks();
+        console.log(`🎤 [Audio Graph] Stream active: ${micStream.active}, Track count: ${tracks.length}`);
+        tracks.forEach((t, idx) => {
+          console.log(`🎤 Track #${idx}: label="${t.label}", readyState="${t.readyState}", enabled=${t.enabled}, muted=${t.muted}`);
+        });
+      } catch (err) {
+        console.error("❌ [Audio Graph] Failed to acquire microphone stream:", err);
+      }
+
+      if (micStream) {
+        const source = inCtx.createMediaStreamSource(micStream);
         const gainNode = inCtx.createGain();
         gainNode.gain.value = 2.0; // Lower manual gain since AGC is enabled
         source.connect(gainNode);
         gainNode.connect(recorderNode);
+        // CRITICAL: Chrome requires an AudioWorkletNode to be connected to the context's destination
+        // to prevent it from being paused or garbage collected by the audio thread.
+        recorderNode.connect(inCtx.destination);
+
+        // CRITICAL: Store nodes in window to prevent Chrome garbage collection silencing the input
+        (window as any)._activeAudioNodes = [source, gainNode, recorderNode, playbackNode];
+        console.log("🔊 [Audio Graph] Node pipeline connected successfully. inCtx state:", inCtx.state);
       } else {
-        console.warn("No mic stream available!");
+        console.warn("⚠️ [Audio Graph] No mic stream available!");
       }
 
       const ws = new WebSocket(API.replace("http://", "ws://").replace("https://", "wss://") + "/ws/live-voice-proxy");
@@ -156,11 +194,21 @@ STRICT RULES — నువ్వు ఏ పరిస్థితిలోనూ 
       };
 
       // Stream mic audio to Gemini continuously
+      let chunkCount = 0;
       recorderNode.port.onmessage = (e) => {
         if (!isSetupComplete || ws.readyState !== WebSocket.OPEN) return;
         if (aiTalkingRef.current) return; // Mute mic while AI speaks to prevent self-interruption
 
         const pcm16 = e.data; // Int16Array
+        chunkCount++;
+        if (chunkCount % 50 === 0) {
+          let maxVal = 0;
+          for (let i = 0; i < pcm16.length; i++) {
+            const val = Math.abs(pcm16[i]);
+            if (val > maxVal) maxVal = val;
+          }
+          console.log(`🎤 [Mic Stream] Sent ${chunkCount} chunks. Last chunk size: ${pcm16.length}, Max Amplitude: ${maxVal}`);
+        }
         const base64 = arrayBufferToBase64(pcm16.buffer);
         ws.send(JSON.stringify({
           realtimeInput: { audio: { data: base64, mimeType: "audio/pcm;rate=16000" } }
@@ -222,6 +270,14 @@ STRICT RULES — నువ్వు ఏ పరిస్థితిలోనూ 
                 if (aiState !== "speaking") console.log("🗣️ [AI Started Speaking]");
                 setAiState("speaking");
                 aiTalkingRef.current = true; // Lock mic
+
+                // If waiting for the goodbye speech to begin, flag it as started
+                if (waitingForGoodbyeSpeechRef.current) {
+                  console.log("🗣️ [Goodbye Speech] Goodbye audio packets received. Flagging goodbyeSpeechStarted = true.");
+                  goodbyeSpeechStartedRef.current = true;
+                  waitingForGoodbyeSpeechRef.current = false;
+                }
+
                 const bin = atob(part.inlineData.data);
                 const b = new Uint8Array(bin.length);
                 for (let i = 0; i < bin.length; i++) b[i] = bin.charCodeAt(i);
@@ -237,6 +293,12 @@ STRICT RULES — నువ్వు ఏ పరిస్థితిలోనూ 
                   aiTalkingRef.current = false; // Unlock mic
                   console.log("🎤 [AI Finished Speaking - Mic Open]");
                   lastAudioTime = Date.now(); // reset timer for next response
+
+                  // If token was generated AND AI finished its goodbye message, transition dynamically!
+                  if (tokenPhaseRef.current && goodbyeSpeechStartedRef.current) {
+                    console.log("✨ [Dynamic Transition] AI finished speaking token goodbye. Switching to token screen.");
+                    transitionToTokenScreen();
+                  }
                 }, 1500); // revert to listening when audio stops
               }
             }
@@ -264,17 +326,24 @@ STRICT RULES — నువ్వు ఏ పరిస్థితిలోనూ 
                 ws.send(JSON.stringify({ toolResponse: { functionResponses: [{ id: call.id, name: call.name, response: { result: "Success" } }] } }));
                 setTokenR({ token: td.token, priority: priority as any, name: pName });
                 tokenPhaseRef.current = true; // Set tokenPhaseRef immediately to prevent early close reset
+                waitingForGoodbyeSpeechRef.current = true;
+                goodbyeSpeechStartedRef.current = false;
               } catch (err) {
                 console.error("❌ Tool call fetch failed", err);
                 setTokenR({ token: "NRM-" + Math.floor(Math.random()*900+100), priority: "normal", name: "Patient" });
                 tokenPhaseRef.current = true;
+                waitingForGoodbyeSpeechRef.current = true;
+                goodbyeSpeechStartedRef.current = false;
               } finally {
-                // Wait for AI to finish speaking its goodbye message before disconnecting
-                setTimeout(() => {
-                  setPhase("token"); disconnectLiveAPI();
-                  let c = 10; setSecs(c); // User requested 10 seconds
-                  const t = setInterval(() => { c--; setSecs(c); if (c <= 0) { clearInterval(t); tokenPhaseRef.current = false; setPhase("scanning"); setFaceImg(null); setTokenR(null); setTimeout(() => { activeRef.current = false; }, 1000); } }, 1000);
-                }, 8000); // 8 seconds allows the full Telugu sentence to speak completely
+                console.log("⏳ [Tool Call] Waiting for AI goodbye speech to complete before transitioning...");
+                // Safety backup timer: if goodbye speech doesn't start or play within 6 seconds, transition anyway
+                const backupTimer = setTimeout(() => {
+                  if (tokenPhaseRef.current && !goodbyeSpeechStartedRef.current) {
+                    console.log("⚠️ [Backup Transition] Goodbye speech did not start. Fallback transition to token screen.");
+                    transitionToTokenScreen();
+                  }
+                }, 6000);
+                (window as any)._backupTransitionTimer = backupTimer;
               }
             }
           }
@@ -354,6 +423,37 @@ STRICT RULES — నువ్వు ఏ పరిస్థితిలోనూ 
 
   const disconnectLiveAPI = useCallback(() => {
     liveWsRef.current?.close();
+
+    // Clear playback node queue to prevent leftover audio in the next session
+    try {
+      playbackNodeRef.current?.port.postMessage("clear");
+      playbackNodeRef.current = null;
+      console.log("🔊 [Audio Graph] Playback buffer cleared.");
+    } catch (err) {
+      console.warn("Failed to clear playback node:", err);
+    }
+    
+    // Stop microphone tracks to release the hardware
+    if (micStreamRef.current) {
+      micStreamRef.current.getTracks().forEach(t => t.stop());
+      micStreamRef.current = null;
+      console.log("🎤 [Audio Graph] Microphone tracks stopped and released.");
+    }
+    
+    // Clear node references to allow GC
+    delete (window as any)._activeAudioNodes;
+    console.log("🔊 [Audio Graph] Nodes cleaned up.");
+
+    // Clear backup transition timers
+    if ((window as any)._backupTransitionTimer) {
+      clearTimeout((window as any)._backupTransitionTimer);
+      delete (window as any)._backupTransitionTimer;
+    }
+
+    // Reset transition refs
+    waitingForGoodbyeSpeechRef.current = false;
+    goodbyeSpeechStartedRef.current = false;
+
     // Do not close AudioContexts to preserve user-gesture permission for subsequent scans.
     // Instead, suspend them.
     audioCtxRef.current?.suspend().catch(() => {});
@@ -361,6 +461,31 @@ STRICT RULES — నువ్వు ఏ పరిస్థితిలోనూ 
     activeRef.current = false;
     setAiState("idle");
   }, []);
+
+  const transitionToTokenScreen = useCallback(() => {
+    // Clear playback buffer just in case
+    try {
+      playbackNodeRef.current?.port.postMessage("clear");
+    } catch (e) {}
+
+    setPhase("token");
+    disconnectLiveAPI();
+
+    let c = 10;
+    setSecs(c);
+    const t = setInterval(() => {
+      c--;
+      setSecs(c);
+      if (c <= 0) {
+        clearInterval(t);
+        tokenPhaseRef.current = false;
+        setPhase("scanning");
+        setFaceImg(null);
+        setTokenR(null);
+        setTimeout(() => { activeRef.current = false; }, 1000);
+      }
+    }, 1000);
+  }, [disconnectLiveAPI]);
 
   /* ── Crop face from live video ───────────────────────────────── */
   const cropFace = useCallback((bbox:{x1:number;y1:number;x2:number;y2:number})=>{
@@ -485,16 +610,14 @@ STRICT RULES — నువ్వు ఏ పరిస్థితిలోనూ 
       try{
         const mic=await navigator.mediaDevices.getUserMedia({
           audio: {
-            channelCount: 1,
-            sampleRate: 16000,
             echoCancellation: true,
             noiseSuppression: true,
             autoGainControl: true
           }
         });
         micStreamRef.current=mic; // keep alive – reused by connectLiveAPI
-      }catch{
-        console.warn("Mic permission denied – voice will not work");
+      }catch(err){
+        console.warn("Mic permission denied or failed – voice will not work:", err);
       }
 
       // Initialize AudioContexts here inside the user gesture callback!
@@ -599,9 +722,9 @@ STRICT RULES — నువ్వు ఏ పరిస్థితిలోనూ 
           <div style={{display:"flex",alignItems:"center",gap:"12px"}}>
             {persons>0&&<span style={{fontSize:"13px",color:"#34d399",fontWeight:600}}>👤 {persons} detected</span>}
             <div style={{display:"flex",alignItems:"center",gap:"6px"}}>
-              <div style={{width:"8px",height:"8px",borderRadius:"50%",background:wsOk?"#10b981":"#ef4444"}}
-                className={wsOk?"pulse-animation":""}/>
-              <span style={{fontSize:"12px",color:wsOk?"#34d399":"#f87171"}}>{wsOk?"AI Live":"Offline"}</span>
+              <div style={{width:"8px",height:"8px",borderRadius:"50%",background:wsOk?"#10b981":(cameraOn?"#f59e0b":"#ef4444")}}
+                className={wsOk||(cameraOn&&!wsOk)?"pulse-animation":""}/>
+              <span style={{fontSize:"12px",color:wsOk?"#34d399":(cameraOn?"#fbbf24":"#f87171")}}>{wsOk?"AI Live":(cameraOn?"AI Connecting...":"Offline")}</span>
             </div>
           </div>
         </div>

@@ -49,7 +49,7 @@ export default function HomePage() {
     },
     {
       id: "camera",
-      title: "Entrance AI",
+      title: "AI Smart Reception",
       subtitle: "Auto Telugu Voice + YOLOv8",
       desc: "Patient వచ్చిన వెంటనే AI automatic గా Telugu లో మాట్లాడుతుంది. No button clicks!",
       icon: "📡",
